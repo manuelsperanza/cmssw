@@ -25,7 +25,7 @@
 </bin>
 
 
-<bin file="SoAUnitTests.cc" name="SoAUnitTests">
+<bin file="SoAtry.cc" name="SoAtry">
   <use name="boost"/>
   <use name="DataFormats/SoATemplate"/>
   <flags CXXFLAGS="-S"/>
@@ -101,3 +101,5 @@
 
 <!-- dictionaries for FakeSoA -->
 <library file="" name="FakeSoADict"/>
+
+
