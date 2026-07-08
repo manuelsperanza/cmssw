@@ -25,10 +25,9 @@
 </bin>
 
 
-<bin file="SoAtry.cc" name="SoAtryAsm">
+<bin file="SoAtry.cc" name="SoAtry">
   <use name="boost"/>
   <use name="DataFormats/SoATemplate"/>
-  <flags CXXFLAGS="-S"/>
 </bin>
 
 
