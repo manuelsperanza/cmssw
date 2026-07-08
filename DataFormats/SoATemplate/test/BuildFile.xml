@@ -24,6 +24,14 @@
   <use name="DataFormats/SoATemplate"/>
 </bin>
 
+
+<bin file="SoAUnitTests.cc" name="SoAUnitTests">
+  <use name="boost"/>
+  <use name="DataFormats/SoATemplate"/>
+  <flags CXXFLAGS="-S"/>
+</bin>
+
+
 <bin file="SoAGenericView_t.cc" name="SoAGenericView_t">
   <use name="boost"/>
   <use name="catch2"/>
