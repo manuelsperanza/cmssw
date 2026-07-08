@@ -11,7 +11,7 @@ using InputLayout = InputLayoutTemplate<>;
 using ResultLayout = ResultLayoutTemplate<>;
 
 int main() {
-  constexpr int size = 8;
+  constexpr int size = 128;
 
   std::unique_ptr<std::byte, decltype(std::free) *> inputMem{
       reinterpret_cast<std::byte *>(aligned_alloc(InputLayout::alignment, InputLayout::computeDataSize(size))),
