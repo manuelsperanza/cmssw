@@ -15,8 +15,8 @@ GENERATE_SOA_LAYOUT(ResultLayoutTemplate,
 using InputLayout = InputLayoutTemplate<>;
 using ResultLayout = ResultLayoutTemplate<>;
 
-using ViewInput = InputLayout::ViewTemplate<cms::soa::RangeChecking::Default>;
-using ViewResult = ResultLayout::ViewTemplate<cms::soa::RangeChecking::Default>;
+using ViewInput = InputLayout::View;
+using ViewResult = ResultLayout::View;
 
 int main(){
 
