@@ -35,6 +35,10 @@
   <use name="DataFormats/SoATemplate"/>
 </bin>
 
+<bin file="SoAIndexedAccessBench.cc" name="SoAIndexedAccessBench">
+  <use name="DataFormats/SoATemplate"/>
+</bin>
+
 
 <bin file="SoAGenericView_t.cc" name="SoAGenericView_t">
   <use name="boost"/>
