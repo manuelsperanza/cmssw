@@ -1,6 +1,6 @@
 // Benchmark: a[i] = y[j]*x[j] + z[j].  Matrix = 4 techniques x 2 access patterns.
-//   patterns : INDIRECT  j = idx[i]  (random permutation -> scattered gather)
-//              DIRECT    j = i        (contiguous)
+//   patterns : SCATTERED   j = idx[i]  (random permutation -> gather)
+//              CONTIGUOUS  j = i
 //   techniques: auto no-check / auto + range check / std::simd + check / AVX2 manual + check
 // Self-contained; built by scram with -march=x86-64-v3 (AVX2).
 //   ./SoAIndexedAccessBench [size] [runs]     e.g. taskset -c 4 ./... 100000000 20
@@ -32,7 +32,7 @@ static int *alloc_i(size_t n) {
 }
 
 // ===========================================================================
-// INDIRECT : j = idx[i]  (scattered)
+// SCATTERED memory access : j = idx[i]
 // ===========================================================================
 
 static void ind_auto_nocheck(const float *x, const float *y, const float *z, const int *idx, float *a, int n) {
@@ -97,8 +97,8 @@ static void ind_avx2(const float *x, const float *y, const float *z, const int *
 }
 
 // ===========================================================================
-// DIRECT : j = i  (contiguous). Same four techniques; here the check is on the
-// loop index, so it is provably dead -> elided, and every variant still
+// CONTIGUOUS memory access : j = i. Same four techniques; here the check is on
+// the loop index, so it is provably dead -> elided, and every variant still
 // vectorizes to packed loads. This is the point of the study.
 // ===========================================================================
 
@@ -180,7 +180,7 @@ static void run(const char *name, F fn, float *a, int n, int runs) {
   double chk = 0;
   for (int i = 0; i < n; ++i)
     chk += a[i];
-  std::printf("  %-22s  min %8.2f ms   mean %8.2f ms   %6.3f ns/elem   [chk %.3e]\n",
+  std::printf("  %-26s  min %8.2f ms   mean %8.2f ms   %6.3f ns/elem   [chk %.3e]\n",
               name, best, sum / runs, best * 1e6 / n, chk);
 }
 
@@ -207,17 +207,19 @@ int main(int argc, char **argv) {
   std::printf("n = %d elements (%.2f GB total), runs = %d, SIMD width = %zu floats\n\n",
               n, 5.0 * n * 4 / 1e9, runs, stdx::native_simd<float>::size());
 
-  std::printf("INDIRECT (scattered, j = idx[i]):\n");
-  run("auto no-check", [&] { ind_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
-  run("auto + check", [&] { ind_auto_check(x, y, z, idx, a, n); }, a, n, runs);
-  run("std::simd + check", [&] { ind_std(x, y, z, idx, a, n); }, a, n, runs);
-  run("AVX2 manual + check", [&] { ind_avx2(x, y, z, idx, a, n); }, a, n, runs);
+  std::printf("SCATTERED memory access (j = idx[i]):\n");
+  run("auto + no range check", [&] { ind_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
+  run("auto + range check", [&] { ind_auto_check(x, y, z, idx, a, n); }, a, n, runs);
+  run("std::simd + range check", [&] { ind_std(x, y, z, idx, a, n); }, a, n, runs);
+  run("AVX2 manual + range check", [&] { ind_avx2(x, y, z, idx, a, n); }, a, n, runs);
 
-  std::printf("\nDIRECT (contiguous, j = i):\n");
-  run("auto no-check", [&] { dir_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
-  run("auto + check", [&] { dir_auto_check(x, y, z, idx, a, n); }, a, n, runs);
-  run("std::simd + check", [&] { dir_std(x, y, z, idx, a, n); }, a, n, runs);
-  run("AVX2 manual + check", [&] { dir_avx2(x, y, z, idx, a, n); }, a, n, runs);
+  std::printf("\nCONTIGUOUS memory access (j = i):\n");
+  run("auto + no range check", [&] { dir_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
+  run("auto + range check", [&] { dir_auto_check(x, y, z, idx, a, n); }, a, n, runs);
+  run("std::simd + range check", [&] { dir_std(x, y, z, idx, a, n); }, a, n, runs);
+  run("AVX2 manual + range check", [&] { dir_avx2(x, y, z, idx, a, n); }, a, n, runs);
+
+  std::printf("\n--- all benchmarks done ---\n");
 
   std::free(x);
   std::free(y);
