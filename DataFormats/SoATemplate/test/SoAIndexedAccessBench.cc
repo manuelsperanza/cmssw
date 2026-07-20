@@ -1,8 +1,15 @@
-// Benchmark: a[i] = y[j]*x[j] + z[j].  Matrix = 4 techniques x 2 access patterns.
+// Benchmark: a[i] = y[j]*x[j] + z[j].  Matrix = 5 techniques x 2 access patterns
+//   (the 5th, SoA View, is SCATTERED-only for now).
 //   patterns : SCATTERED   j = idx[i]  (random permutation -> gather)
 //              CONTIGUOUS  j = i
-//   techniques: auto no-check / auto + range check / std::simd + check / AVX2 manual + check
-// Self-contained; built by scram with -march=x86-64-v3 (AVX2).
+//   techniques: auto no-check / auto + range check / std::simd + check /
+//               AVX2 manual + check / SoA View (std::simd + check, via
+//               SoASimdView.h -- same std::simd technique as ind_std, but
+//               reached through the SoA View's own methods instead of raw
+//               pointers, to check the wrapper is zero-cost)
+// Built by scram with -march=x86-64-v3 (AVX2). Needs the CMSSW SoATemplate
+// headers (boost) now, because of the SoA View technique -- so the BuildFile
+// bin uses <use name="boost"/> and <use name="DataFormats/SoATemplate"/>.
 //   ./SoAIndexedAccessBench [size] [runs]     e.g. taskset -c 4 ./... 100000000 20
 
 #include <immintrin.h>
@@ -14,11 +21,31 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 
+#include "DataFormats/SoATemplate/interface/SoALayout.h"
+
+#include "SoASimdView.h"
+
 namespace stdx = std::experimental;
+
+GENERATE_SOA_LAYOUT(InputLayoutTemplate,
+                    SOA_COLUMN(float, x),
+                    SOA_COLUMN(float, y),
+                    SOA_COLUMN(float, z),
+                    SOA_COLUMN(int, idx))
+GENERATE_SOA_LAYOUT(ResultLayoutTemplate, SOA_COLUMN(float, a))
+
+using InputLayout = InputLayoutTemplate<>;
+using ResultLayout = ResultLayoutTemplate<>;
+using ResultView = ResultLayout::View;
+using EnabledView = InputLayout::ViewTemplate<cms::soa::RestrictQualify::Default, cms::soa::RangeChecking::enabled>;
+
+using SimdInput = SimdInputView<EnabledView>;
+using SimdResult = SimdResultView<ResultView>;
 
 static inline void escape(void *p) { asm volatile("" : : "g"(p) : "memory"); }
 
@@ -93,6 +120,23 @@ static void ind_avx2(const float *x, const float *y, const float *z, const int *
     if (j < 0 || j >= n)
       throw std::out_of_range("idx");
     a[i] = y[j] * x[j] + z[j];
+  }
+}
+
+// Same technique as ind_std, but reached through SimdInputView/SimdResultView
+// (SoASimdView.h) instead of raw pointers -- the SIMD load, the
+// batched range check and the gather are all methods on the (extended) View.
+static void ind_view(SimdInput &sview, SimdResult &sresult, int n) {
+  constexpr int W = SimdInput::width;
+  int i = 0;
+  for (; i + W <= n; i += W) {
+    auto vj = sview.simdLoadIdx(i);
+    auto row = sview.simdGather(vj);
+    sresult.simdStoreA(i, row.y * row.x + row.z);
+  }
+  for (; i < n; ++i) {
+    const int j = sview[i].idx();
+    sresult[i].a() = sview[j].y() * sview[j].x() + sview[j].z();
   }
 }
 
@@ -185,7 +229,7 @@ static void run(const char *name, F fn, float *a, int n, int runs) {
 }
 
 int main(int argc, char **argv) {
-  int n = (argc > 1) ? std::atoi(argv[1]) : 100000000;  // ~2 GB across 5 arrays
+  int n = (argc > 1) ? std::atoi(argv[1]) : 100000000;  // ~2 GB across 5 arrays, +~2 GB more for the SoA View buffers
   int runs = (argc > 2) ? std::atoi(argv[2]) : 20;
 
   float *x = alloc_f(n), *y = alloc_f(n), *z = alloc_f(n), *a = alloc_f(n);
@@ -204,6 +248,23 @@ int main(int argc, char **argv) {
   std::mt19937 rng(12345);
   std::shuffle(idx, idx + n, rng);
 
+  // Separate allocation backing the SoA View technique (ind_view): a real
+  // InputLayout/ResultLayout, filled from the same x/y/z/idx data above so
+  // its checksum is directly comparable to the raw-pointer techniques'.
+  std::unique_ptr<std::byte, decltype(std::free) *> viewInputMem{
+      reinterpret_cast<std::byte *>(aligned_alloc(InputLayout::alignment, InputLayout::computeDataSize(n))),
+      std::free};
+  InputLayout viewInputLayout{viewInputMem.get(), n};
+  SimdInput sview{viewInputLayout};
+  for (int i = 0; i < n; ++i)
+    sview[i] = {x[i], y[i], z[i], idx[i]};
+
+  std::unique_ptr<std::byte, decltype(std::free) *> viewResultMem{
+      reinterpret_cast<std::byte *>(aligned_alloc(ResultLayout::alignment, ResultLayout::computeDataSize(n))),
+      std::free};
+  ResultLayout viewResultLayout{viewResultMem.get(), n};
+  SimdResult sresult{viewResultLayout};
+
   std::printf("n = %d elements (%.2f GB total), runs = %d, SIMD width = %zu floats\n\n",
               n, 5.0 * n * 4 / 1e9, runs, stdx::native_simd<float>::size());
 
@@ -212,6 +273,11 @@ int main(int argc, char **argv) {
   run("auto + range check", [&] { ind_auto_check(x, y, z, idx, a, n); }, a, n, runs);
   run("std::simd + range check", [&] { ind_std(x, y, z, idx, a, n); }, a, n, runs);
   run("AVX2 manual + range check", [&] { ind_avx2(x, y, z, idx, a, n); }, a, n, runs);
+  run("SoA View (std::simd + check)",
+      [&] { ind_view(sview, sresult, n); },
+      sresult.metadata().addressOf_a(),
+      n,
+      runs);
 
   std::printf("\nCONTIGUOUS memory access (j = i):\n");
   run("auto + no range check", [&] { dir_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
