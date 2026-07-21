@@ -1,15 +1,17 @@
 // Benchmark: a[i] = y[j]*x[j] + z[j].  Matrix = 5 techniques x 2 access patterns
-//   (the 5th, SoA View, is SCATTERED-only for now).
+//   (the 5th, SoA View, uses SimdInputView/SimdResultView from codes/view/).
 //   patterns : SCATTERED   j = idx[i]  (random permutation -> gather)
 //              CONTIGUOUS  j = i
-//   techniques: auto no-check / auto + range check / std::simd + check /
-//               AVX2 manual + check / SoA View (std::simd + check, via
-//               SoASimdView.h -- same std::simd technique as ind_std, but
-//               reached through the SoA View's own methods instead of raw
-//               pointers, to check the wrapper is zero-cost)
+//   techniques: auto no-check (DisabledView) / auto + range check (EnabledView) /
+//               std::simd + check / AVX2 manual + check / SoA View
+//
+// Every technique goes through a SoA View: the two "auto" rows index the View
+// directly (so the FRAMEWORK does the range checking, which is the point), and
+// the manual-SIMD rows take the View and pull their raw column pointers out of
+// metadata() -- no free-standing arrays anywhere.
+//
 // Built by scram with -march=x86-64-v3 (AVX2). Needs the CMSSW SoATemplate
-// headers (boost) now, because of the SoA View technique -- so the BuildFile
-// bin uses <use name="boost"/> and <use name="DataFormats/SoATemplate"/>.
+// headers (boost).
 //   ./SoAIndexedAccessBench [size] [runs]     e.g. taskset -c 4 ./... 100000000 20
 
 #include <immintrin.h>
@@ -21,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -43,42 +46,45 @@ using InputLayout = InputLayoutTemplate<>;
 using ResultLayout = ResultLayoutTemplate<>;
 using ResultView = ResultLayout::View;
 using EnabledView = InputLayout::ViewTemplate<cms::soa::RestrictQualify::Default, cms::soa::RangeChecking::enabled>;
+using DisabledView = InputLayout::ViewTemplate<cms::soa::RestrictQualify::Default, cms::soa::RangeChecking::disabled>;
 
 using SimdInput = SimdInputView<EnabledView>;
 using SimdResult = SimdResultView<ResultView>;
 
 static inline void escape(void *p) { asm volatile("" : : "g"(p) : "memory"); }
 
-static float *alloc_f(size_t n) {
-  size_t bytes = ((n * sizeof(float) + 63) / 64) * 64;
-  return static_cast<float *>(std::aligned_alloc(64, bytes));
-}
-static int *alloc_i(size_t n) {
-  size_t bytes = ((n * sizeof(int) + 63) / 64) * 64;
-  return static_cast<int *>(std::aligned_alloc(64, bytes));
-}
-
 // ===========================================================================
 // SCATTERED memory access : j = idx[i]
 // ===========================================================================
 
-static void ind_auto_nocheck(const float *x, const float *y, const float *z, const int *idx, float *a, int n) {
+// Range checking disabled in the View type -> the framework emits no check.
+static void ind_auto_nocheck(DisabledView &in, ResultView &out, int n) {
   for (int i = 0; i < n; ++i) {
-    const int j = idx[i];
-    a[i] = y[j] * x[j] + z[j];
+    const int j = in[i].idx();
+    out[i].a() = in[j].y() * in[j].x() + in[j].z();
   }
 }
 
-static void ind_auto_check(const float *x, const float *y, const float *z, const int *idx, float *a, int n) {
-  for (int i = 0; i < n; ++i) {
-    const int j = idx[i];
-    if (j < 0 || j >= n)
-      throw std::out_of_range("idx");
-    a[i] = y[j] * x[j] + z[j];
+// Range checking enabled -> the FRAMEWORK checks every operator[]; the
+// try/catch is what a user would write, not a hand-rolled check.
+static void ind_auto_check(EnabledView &in, ResultView &out, int n) {
+  try {
+    for (int i = 0; i < n; ++i) {
+      const int j = in[i].idx();
+      out[i].a() = in[j].y() * in[j].x() + in[j].z();
+    }
+  } catch (const std::out_of_range &e) {
+    std::cerr << "access out of range: " << e.what() << '\n';
   }
 }
 
-static void ind_std(const float *x, const float *y, const float *z, const int *idx, float *a, int n) {
+static void ind_std(EnabledView &in, ResultView &out, int n) {
+  const float *x = in.metadata().addressOf_x();
+  const float *y = in.metadata().addressOf_y();
+  const float *z = in.metadata().addressOf_z();
+  const int *idx = in.metadata().addressOf_idx();
+  float *a = out.metadata().addressOf_a();
+
   using vfloat = stdx::native_simd<float>;
   using vint = stdx::rebind_simd_t<int, vfloat>;
   constexpr int W = static_cast<int>(vfloat::size());
@@ -101,7 +107,13 @@ static void ind_std(const float *x, const float *y, const float *z, const int *i
   }
 }
 
-static void ind_avx2(const float *x, const float *y, const float *z, const int *idx, float *a, int n) {
+static void ind_avx2(EnabledView &in, ResultView &out, int n) {
+  const float *x = in.metadata().addressOf_x();
+  const float *y = in.metadata().addressOf_y();
+  const float *z = in.metadata().addressOf_z();
+  const int *idx = in.metadata().addressOf_idx();
+  float *a = out.metadata().addressOf_a();
+
   const __m256i vzero = _mm256_setzero_si256();
   const __m256i vnm1 = _mm256_set1_epi32(n - 1);
   int i = 0;
@@ -123,43 +135,47 @@ static void ind_avx2(const float *x, const float *y, const float *z, const int *
   }
 }
 
-// Same technique as ind_std, but reached through SimdInputView/SimdResultView
-// (SoASimdView.h) instead of raw pointers -- the SIMD load, the
-// batched range check and the gather are all methods on the (extended) View.
-static void ind_view(SimdInput &sview, SimdResult &sresult, int n) {
-  constexpr int W = SimdInput::width;
-  int i = 0;
-  for (; i + W <= n; i += W) {
-    auto vj = sview.simdLoadIdx(i);
-    auto row = sview.simdGather(vj);
-    sresult.simdStoreA(i, row.y * row.x + row.z);
-  }
-  for (; i < n; ++i) {
-    const int j = sview[i].idx();
-    sresult[i].a() = sview[j].y() * sview[j].x() + sview[j].z();
+// Identical in shape to ind_auto_check above: same indexing, same expression,
+// same try/catch. Only `int j` becomes a vector of indices and the loop steps
+// by width instead of 1 -- that is the whole point, manual vectorization with
+// the API unchanged. No tail loop: the partial chunk is masked in the view.
+static void ind_view(SimdInput &in, SimdResult &out, int n) {
+  try {
+    for (int i = 0; i < n; i += SimdInput::width) {
+      const auto j = in[i].idx();
+      out[i].a() = in[j].y() * in[j].x() + in[j].z();
+    }
+  } catch (const std::out_of_range &e) {
+    std::cerr << "access out of range: " << e.what() << '\n';
   }
 }
 
 // ===========================================================================
-// CONTIGUOUS memory access : j = i. Same four techniques; here the check is on
+// CONTIGUOUS memory access : j = i. Same five techniques; here the check is on
 // the loop index, so it is provably dead -> elided, and every variant still
 // vectorizes to packed loads. This is the point of the study.
 // ===========================================================================
 
-static void dir_auto_nocheck(const float *x, const float *y, const float *z, const int *, float *a, int n) {
+static void dir_auto_nocheck(DisabledView &in, ResultView &out, int n) {
   for (int i = 0; i < n; ++i)
-    a[i] = y[i] * x[i] + z[i];
+    out[i].a() = in[i].y() * in[i].x() + in[i].z();
 }
 
-static void dir_auto_check(const float *x, const float *y, const float *z, const int *, float *a, int n) {
-  for (int i = 0; i < n; ++i) {
-    if (i < 0 || i >= n)
-      throw std::out_of_range("idx");
-    a[i] = y[i] * x[i] + z[i];
+static void dir_auto_check(EnabledView &in, ResultView &out, int n) {
+  try {
+    for (int i = 0; i < n; ++i)
+      out[i].a() = in[i].y() * in[i].x() + in[i].z();
+  } catch (const std::out_of_range &e) {
+    std::cerr << "access out of range: " << e.what() << '\n';
   }
 }
 
-static void dir_std(const float *x, const float *y, const float *z, const int *, float *a, int n) {
+static void dir_std(EnabledView &in, ResultView &out, int n) {
+  const float *x = in.metadata().addressOf_x();
+  const float *y = in.metadata().addressOf_y();
+  const float *z = in.metadata().addressOf_z();
+  float *a = out.metadata().addressOf_a();
+
   using vfloat = stdx::native_simd<float>;
   using vint = stdx::rebind_simd_t<int, vfloat>;
   constexpr int W = static_cast<int>(vfloat::size());
@@ -181,7 +197,12 @@ static void dir_std(const float *x, const float *y, const float *z, const int *,
   }
 }
 
-static void dir_avx2(const float *x, const float *y, const float *z, const int *, float *a, int n) {
+static void dir_avx2(EnabledView &in, ResultView &out, int n) {
+  const float *x = in.metadata().addressOf_x();
+  const float *y = in.metadata().addressOf_y();
+  const float *z = in.metadata().addressOf_z();
+  float *a = out.metadata().addressOf_a();
+
   const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
   const __m256i vzero = _mm256_setzero_si256();
   const __m256i vnm1 = _mm256_set1_epi32(n - 1);
@@ -200,6 +221,16 @@ static void dir_avx2(const float *x, const float *y, const float *z, const int *
     if (i < 0 || i >= n)
       throw std::out_of_range("idx");
     a[i] = y[i] * x[i] + z[i];
+  }
+}
+
+// Identical in shape to dir_auto_check above; only the loop step differs.
+static void dir_view(SimdInput &in, SimdResult &out, int n) {
+  try {
+    for (int i = 0; i < n; i += SimdInput::width)
+      out[i].a() = in[i].y() * in[i].x() + in[i].z();
+  } catch (const std::out_of_range &e) {
+    std::cerr << "access out of range: " << e.what() << '\n';
   }
 }
 
@@ -229,68 +260,69 @@ static void run(const char *name, F fn, float *a, int n, int runs) {
 }
 
 int main(int argc, char **argv) {
-  int n = (argc > 1) ? std::atoi(argv[1]) : 100000000;  // ~2 GB across 5 arrays, +~2 GB more for the SoA View buffers
-  int runs = (argc > 2) ? std::atoi(argv[2]) : 20;
+  // 20 B/elem -> ~5 GB, ~20x the largest L3 on the machine, so nothing can sit
+  // in cache and the scattered rows pay real DRAM latency.
+  int n = (argc > 1) ? std::atoi(argv[1]) : 250000000;
+  int runs = (argc > 2) ? std::atoi(argv[2]) : 10;
 
-  float *x = alloc_f(n), *y = alloc_f(n), *z = alloc_f(n), *a = alloc_f(n);
-  int *idx = alloc_i(n);
-  if (!x || !y || !z || !a || !idx) {
-    std::fprintf(stderr, "allocation failed for n=%d (need ~%.1f GB)\n", n, 5.0 * n * 4 / 1e9);
+  // Scratch index array: identity, then shuffled into a random permutation.
+  // Copied into the SoA layout below, then released.
+  std::unique_ptr<int, decltype(std::free) *> idxMem{
+      static_cast<int *>(std::aligned_alloc(64, ((n * sizeof(int) + 63) / 64) * 64)), std::free};
+  if (!idxMem) {
+    std::fprintf(stderr, "allocation failed for the index array (n=%d)\n", n);
     return 1;
   }
-
-  for (int i = 0; i < n; ++i) {
-    x[i] = float(i) * 1.0f;
-    y[i] = float(i) * 2.0f;
-    z[i] = float(i) * 3.0f;
+  int *idx = idxMem.get();
+  for (int i = 0; i < n; ++i)
     idx[i] = i;
-  }
   std::mt19937 rng(12345);
   std::shuffle(idx, idx + n, rng);
 
-  // Separate allocation backing the SoA View technique (ind_view): a real
-  // InputLayout/ResultLayout, filled from the same x/y/z/idx data above so
-  // its checksum is directly comparable to the raw-pointer techniques'.
-  std::unique_ptr<std::byte, decltype(std::free) *> viewInputMem{
-      reinterpret_cast<std::byte *>(aligned_alloc(InputLayout::alignment, InputLayout::computeDataSize(n))),
+  std::unique_ptr<std::byte, decltype(std::free) *> inputMem{
+      reinterpret_cast<std::byte *>(std::aligned_alloc(InputLayout::alignment, InputLayout::computeDataSize(n))),
       std::free};
-  InputLayout viewInputLayout{viewInputMem.get(), n};
-  SimdInput sview{viewInputLayout};
-  for (int i = 0; i < n; ++i)
-    sview[i] = {x[i], y[i], z[i], idx[i]};
+  std::unique_ptr<std::byte, decltype(std::free) *> resultMem{
+      reinterpret_cast<std::byte *>(std::aligned_alloc(ResultLayout::alignment, ResultLayout::computeDataSize(n))),
+      std::free};
+  if (!inputMem || !resultMem) {
+    std::fprintf(stderr, "allocation failed for n=%d (need ~%.1f GB)\n", n, 20.0 * n / 1e9);
+    return 1;
+  }
 
-  std::unique_ptr<std::byte, decltype(std::free) *> viewResultMem{
-      reinterpret_cast<std::byte *>(aligned_alloc(ResultLayout::alignment, ResultLayout::computeDataSize(n))),
-      std::free};
-  ResultLayout viewResultLayout{viewResultMem.get(), n};
-  SimdResult sresult{viewResultLayout};
+  InputLayout inputLayout{inputMem.get(), n};
+  ResultLayout resultLayout{resultMem.get(), n};
+
+  EnabledView enabledView{inputLayout};
+  DisabledView disabledView{inputLayout};
+  ResultView resultView{resultLayout};
+  SimdInput sview{inputLayout};
+  SimdResult sresult{resultLayout};
+
+  for (int i = 0; i < n; ++i)
+    enabledView[i] = {float(i), float(i) * 2.f, float(i) * 3.f, idx[i]};
+
+  idxMem.reset();  // the permutation now lives in the layout's idx column
+
+  float *chkPtr = resultView.metadata().addressOf_a();
 
   std::printf("n = %d elements (%.2f GB total), runs = %d, SIMD width = %zu floats\n\n",
-              n, 5.0 * n * 4 / 1e9, runs, stdx::native_simd<float>::size());
+              n, 20.0 * n / 1e9, runs, stdx::native_simd<float>::size());
 
   std::printf("SCATTERED memory access (j = idx[i]):\n");
-  run("auto + no range check", [&] { ind_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
-  run("auto + range check", [&] { ind_auto_check(x, y, z, idx, a, n); }, a, n, runs);
-  run("std::simd + range check", [&] { ind_std(x, y, z, idx, a, n); }, a, n, runs);
-  run("AVX2 manual + range check", [&] { ind_avx2(x, y, z, idx, a, n); }, a, n, runs);
-  run("SoA View (std::simd + check)",
-      [&] { ind_view(sview, sresult, n); },
-      sresult.metadata().addressOf_a(),
-      n,
-      runs);
+  run("auto + no range check", [&] { ind_auto_nocheck(disabledView, resultView, n); }, chkPtr, n, runs);
+  run("auto + range check", [&] { ind_auto_check(enabledView, resultView, n); }, chkPtr, n, runs);
+  run("std::simd + range check", [&] { ind_std(enabledView, resultView, n); }, chkPtr, n, runs);
+  run("AVX2 manual + range check", [&] { ind_avx2(enabledView, resultView, n); }, chkPtr, n, runs);
+  run("SoA View + range check", [&] { ind_view(sview, sresult, n); }, chkPtr, n, runs);
 
   std::printf("\nCONTIGUOUS memory access (j = i):\n");
-  run("auto + no range check", [&] { dir_auto_nocheck(x, y, z, idx, a, n); }, a, n, runs);
-  run("auto + range check", [&] { dir_auto_check(x, y, z, idx, a, n); }, a, n, runs);
-  run("std::simd + range check", [&] { dir_std(x, y, z, idx, a, n); }, a, n, runs);
-  run("AVX2 manual + range check", [&] { dir_avx2(x, y, z, idx, a, n); }, a, n, runs);
+  run("auto + no range check", [&] { dir_auto_nocheck(disabledView, resultView, n); }, chkPtr, n, runs);
+  run("auto + range check", [&] { dir_auto_check(enabledView, resultView, n); }, chkPtr, n, runs);
+  run("std::simd + range check", [&] { dir_std(enabledView, resultView, n); }, chkPtr, n, runs);
+  run("AVX2 manual + range check", [&] { dir_avx2(enabledView, resultView, n); }, chkPtr, n, runs);
+  run("SoA View + range check", [&] { dir_view(sview, sresult, n); }, chkPtr, n, runs);
 
   std::printf("\n--- all benchmarks done ---\n");
-
-  std::free(x);
-  std::free(y);
-  std::free(z);
-  std::free(a);
-  std::free(idx);
   return 0;
 }
