@@ -1,34 +1,24 @@
-#pragma once
+#ifndef DataFormats_SoATemplate_test_SoASimdView_h
+#define DataFormats_SoATemplate_test_SoASimdView_h
 
 #include <experimental/simd>
 #include <stdexcept>
 
+#include "DataFormats/SoATemplate/interface/SoACommon.h"  // cms::soa::RangeChecking
+
+#include "SoASimdLaned.h"
+#include "SoASimdMasked.h"
+
+// SIMD wrappers over a range-checked SoA View. They expose the same operator[]
+// API as the base View but return a chunk of `width` rows at once, so a loop
+// stepping by `width` keeps the exact source shape of the scalar version. The
+// framework range check is preserved (batched once per chunk); the partial
+// final chunk is handled by masking, and its trailing lanes are made
+// inaccessible through laned<> (SoASimdLaned.h).
+
 namespace stdx = std::experimental;
-
-// A simd vector plus its number of valid lanes (n_ == V::size() when full).
-// The whole-vector value v_ is untouched -- arithmetic still runs on all lanes
-// (the trailing ones hold zero-filled garbage and are dropped by the masked
-// store). n_ exists only to guard per-lane access: reading a trailing lane
-// throws instead of silently handing back a bogus value.
-template <typename V>
-struct laned {
-  V v_;
-  int n_;
-
-  auto operator[](int k) const {
-    if (k < 0 || k >= n_)
-      throw std::out_of_range("laned: lane out of range");
-    return v_[k];
-  }
-  int size() const { return n_; }
-
-  friend laned operator*(const laned &a, const laned &b) {
-    return {a.v_ * b.v_, a.n_ < b.n_ ? a.n_ : b.n_};
-  }
-  friend laned operator+(const laned &a, const laned &b) {
-    return {a.v_ + b.v_, a.n_ < b.n_ ? a.n_ : b.n_};
-  }
-};
+using soa_simd::maskedLoad;
+using soa_simd::maskedStore;
 
 template <typename BaseInputView>
 struct SimdInputView : public BaseInputView {
@@ -38,53 +28,14 @@ struct SimdInputView : public BaseInputView {
   using vint = stdx::rebind_simd_t<int, vfloat>;
   static constexpr int width = static_cast<int>(vfloat::size());
 
-  static vfloat maskedLoad(const float *p, int lanes) {
-    vfloat v(0.f);
-    if (lanes >= width) {
-      v.copy_from(p, stdx::element_aligned);
-      return v;
-    }
-    const vfloat lane([](auto k) { return static_cast<float>(k); });
-    stdx::where(lane < vfloat(static_cast<float>(lanes)), v).copy_from(p, stdx::element_aligned);
-    return v;
-  }
-
-  static vint maskedLoad(const int *p, int lanes) {
-    vint v(0);
-    if (lanes >= width) {
-      v.copy_from(p, stdx::element_aligned);
-      return v;
-    }
-    const vint lane([](auto k) { return static_cast<int>(k); });
-    stdx::where(lane < vint(lanes), v).copy_from(p, stdx::element_aligned);
-    return v;
-  }
-
-  static void maskedStore(float *p, const vfloat &v, int lanes) {
-    if (lanes >= width) {
-      v.copy_to(p, stdx::element_aligned);
-      return;
-    }
-    const vfloat lane([](auto k) { return static_cast<float>(k); });
-    stdx::where(lane < vfloat(static_cast<float>(lanes)), v).copy_to(p, stdx::element_aligned);
-  }
-
-  static void maskedStore(int *p, const vint &v, int lanes) {
-    if (lanes >= width) {
-      v.copy_to(p, stdx::element_aligned);
-      return;
-    }
-    const vint lane([](auto k) { return static_cast<int>(k); });
-    stdx::where(lane < vint(lanes), v).copy_to(p, stdx::element_aligned);
-  }
-
+  // valid lanes in the chunk starting at i (== width except for the last one)
   int lanesAt(int i) const {
     const int rem = static_cast<int>(this->metadata().size()) - i;
     return rem < width ? rem : width;
   }
 
-  // Value element: carries the loaded vectors + the chunk's valid-lane count.
-  // Accessors hand back laned<> so trailing lanes cannot be read by hand.
+  // a chunk of x,y,z,idx plus its valid-lane count; accessors return laned<> so
+  // trailing lanes cannot be read by hand.
   struct simd_element {
     vfloat x_, y_, z_;
     vint idx_;
@@ -96,7 +47,7 @@ struct SimdInputView : public BaseInputView {
     laned<vint> idx() const { return {idx_, lanes_}; }
   };
 
-  // Write proxy: same accessors, plus store-on-assignment.
+  // write proxy: same accessors, plus masked store on assignment
   struct simd_element_ref {
     float *x_, *y_, *z_;
     int *idx_;
@@ -116,6 +67,7 @@ struct SimdInputView : public BaseInputView {
     laned<vint> idx() const { return {maskedLoad(idx_, lanes_), lanes_}; }
   };
 
+  // non-const: write the chunk at i
   simd_element_ref operator[](int i) {
     if constexpr (BaseInputView::rangeChecking == cms::soa::RangeChecking::enabled) {
       if (i < 0 || i >= static_cast<int>(this->metadata().size()))
@@ -128,6 +80,7 @@ struct SimdInputView : public BaseInputView {
                             lanesAt(i)};
   }
 
+  // const: read the contiguous chunk at i
   simd_element operator[](int i) const {
     if constexpr (BaseInputView::rangeChecking == cms::soa::RangeChecking::enabled) {
       if (i < 0 || i >= static_cast<int>(this->metadata().size()))
@@ -141,13 +94,11 @@ struct SimdInputView : public BaseInputView {
                         lanes};
   }
 
-  // Gather by a raw vector of indices: every lane is an independent row, so the
-  // result is full (lanes_ == width).
+  // gather at an explicit vector of rows; every lane is an independent full row
   simd_element operator[](const vint &vj) const {
     if constexpr (BaseInputView::rangeChecking == cms::soa::RangeChecking::enabled) {
       const vint n(static_cast<int>(this->metadata().size()));
-      auto bad = (vj < vint(0)) || (vj >= n);
-      if (stdx::any_of(bad))
+      if (stdx::any_of((vj < vint(0)) || (vj >= n)))
         throw std::out_of_range("SimdInputView::operator[](vint) out of range");
     }
     const float *x = this->metadata().addressOf_x();
@@ -161,8 +112,8 @@ struct SimdInputView : public BaseInputView {
                         width};
   }
 
-  // Gather by laned indices: the lane count flows through, so a tail chunk's
-  // gathered row is marked partial and its trailing lanes stay inaccessible.
+  // gather at laned indices: the lane count flows through, so a tail chunk's
+  // gathered row keeps its trailing lanes inaccessible
   simd_element operator[](const laned<vint> &vj) const {
     simd_element e = (*this)[vj.v_];
     e.lanes_ = vj.n_;
@@ -178,21 +129,12 @@ struct SimdResultView : public BaseResultView {
   using vint = stdx::rebind_simd_t<int, vfloat>;
   static constexpr int width = static_cast<int>(vfloat::size());
 
-  static void maskedStore(float *p, const vfloat &v, int lanes) {
-    if (lanes >= width) {
-      v.copy_to(p, stdx::element_aligned);
-      return;
-    }
-    const vfloat lane([](auto k) { return static_cast<float>(k); });
-    stdx::where(lane < vfloat(static_cast<float>(lanes)), v).copy_to(p, stdx::element_aligned);
-  }
-
   int lanesAt(int i) const {
     const int rem = static_cast<int>(this->metadata().size()) - i;
     return rem < width ? rem : width;
   }
 
-  // --- contiguous chunk at i: sresult[i].a() = va ---------------------------
+  // contiguous store: sresult[i].a() = va
   struct a_chunk_ref {
     float *p_;
     int lanes_;
@@ -200,8 +142,7 @@ struct SimdResultView : public BaseResultView {
       maskedStore(p_, va.v_, lanes_);
       return *this;
     }
-    // read one valid lane; a trailing lane throws.
-    float operator[](int k) const {
+    float operator[](int k) const {  // read one valid lane; a trailing lane throws
       if (k < 0 || k >= lanes_)
         throw std::out_of_range("a_chunk_ref: lane out of range");
       return p_[k];
@@ -222,9 +163,9 @@ struct SimdResultView : public BaseResultView {
     return simd_element_ref{this->metadata().addressOf_a() + i, lanesAt(i)};
   }
 
-  // --- scatter at vj: sresult[vj].a() = va ----------------------------------
-  // Lane-by-lane (no hardware scatter below AVX-512). Only the lanes_ valid
-  // lanes are written, so a partial tail chunk no longer scatters into row 0.
+  // scatter store: sresult[vj].a() = va. No hardware scatter below AVX-512, so
+  // lane by lane -- only the valid lanes are written, so a partial tail chunk no
+  // longer scatters into row 0.
   struct a_scatter_ref {
     float *base_;
     vint vj_;
@@ -246,10 +187,11 @@ struct SimdResultView : public BaseResultView {
   simd_element_scatter_ref operator[](const laned<vint> &vj) {
     if constexpr (BaseResultView::rangeChecking == cms::soa::RangeChecking::enabled) {
       const vint n(static_cast<int>(this->metadata().size()));
-      auto bad = (vj.v_ < vint(0)) || (vj.v_ >= n);
-      if (stdx::any_of(bad))
+      if (stdx::any_of((vj.v_ < vint(0)) || (vj.v_ >= n)))
         throw std::out_of_range("SimdResultView::operator[](vint) out of range");
     }
     return simd_element_scatter_ref{this->metadata().addressOf_a(), vj.v_, vj.n_};
   }
 };
+
+#endif  // DataFormats_SoATemplate_test_SoASimdView_h
