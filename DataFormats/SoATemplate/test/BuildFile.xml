@@ -25,17 +25,12 @@
 </bin>
 
 
-<bin file="SoAtry.cc" name="SoAtry">
-  <use name="boost"/>
-  <use name="DataFormats/SoATemplate"/>
-</bin>
-
-<bin file="SoAtryRangeChecking.cc" name="SoAtryRangeChecking">
-  <use name="boost"/>
-  <use name="DataFormats/SoATemplate"/>
-</bin>
-
 <bin file="SoAIndexedAccessBench.cc" name="SoAIndexedAccessBench">
+  <use name="boost"/>
+  <use name="DataFormats/SoATemplate"/>
+</bin>
+
+<bin file="SoASimdViewTest.cc" name="SoASimdViewTest">
   <use name="boost"/>
   <use name="DataFormats/SoATemplate"/>
 </bin>
