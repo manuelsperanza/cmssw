@@ -95,7 +95,7 @@ namespace cms::soa {
   namespace RangeChecking {
     constexpr bool enabled = true;
     constexpr bool disabled = false;
-    constexpr bool Default = enabled;
+    constexpr bool Default = disabled;  // BENCHMARK: range checking globally OFF (was enabled)
   }  // namespace RangeChecking
 
   template <typename T, bool RESTRICT_QUALIFY>
