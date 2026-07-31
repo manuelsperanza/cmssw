@@ -31,6 +31,10 @@
 #include "CAHitNtupletGeneratorKernels.h"
 #include "CAStructures.h"
 
+// Masked-SIMD view. Self-guarding: picks SIMD on CPU backends and plain scalar
+// access on GPU backends, so the kernel code below is the same for both.
+#include "DataFormats/SoATemplate/interface/SoASimdTrackView.h"
+
 namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
 
   using namespace ::caStructures;
@@ -711,8 +715,9 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
                                   HitContainer const *__restrict__ foundNtuplets,
                                   HitsConstView hh) const {
       // copy offsets
-      for (auto idx : cms::alpakatools::uniform_elements(acc, foundNtuplets->nOnes() - 1)) {
-        tracks_view[idx].hitOffsets() = foundNtuplets->off[idx + 1];  // offset for track 0 is always 0
+      soa_simd::SimdTrackView<TkSoAView> tracks_simd{tracks_view};
+      for (auto span : soa_simd::uniform_spans(acc, foundNtuplets->nOnes() - 1)) {
+        tracks_simd[span].hitOffsets() = soa_simd::load(foundNtuplets->off.data() + span + 1, span);
       }
       // fill hit indices
       for (auto idx : cms::alpakatools::uniform_elements(acc, foundNtuplets->size())) {
