@@ -980,11 +980,7 @@ namespace ALPAKA_ACCELERATOR_NAMESPACE::caHitNtupletGeneratorKernels {
         tracks_view.nTracks() = ntracks;
 
       // copy offsets
-      soa_simd::SimdTrackView<TkSoAView> tracks_simd{tracks_view};
-      for (auto span : soa_simd::uniform_spans(acc, ntracks)) {
-        // offset for track 0 is always 0
-        tracks_simd[span].hitOffsets() = soa_simd::load(foundNtuplets->off.data() + span + 1, span);
-      }
+      soa_simd::copyHitOffsets(acc, tracks_view, foundNtuplets->off.data(), ntracks);
       // fill hit indices
       for (auto idx : cms::alpakatools::uniform_elements(acc, foundNtuplets->size())) {
         ALPAKA_ASSERT_ACC(foundNtuplets->content[idx] < (uint32_t)hh.metadata().size());

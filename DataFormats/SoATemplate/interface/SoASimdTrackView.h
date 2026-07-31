@@ -3,16 +3,22 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <stdexcept>
 
 #include <alpaka/alpaka.hpp>
 
 #include "HeterogeneousCore/AlpakaInterface/interface/workdivision.h"
 
-// std::experimental::simd is host-only, so it must not be seen by the CUDA/ROCm
-// device pass. Everything below still compiles there, with max_lanes == 1.
+// std::experimental::simd is host-only. __HIP_DEVICE_COMPILE__ / __CUDA_ARCH__ are NOT
+// enough on their own to keep it out of device code: ALPAKA_FN_ACC expands to
+// __host__ __device__, and clang type-checks such functions for BOTH targets, so a
+// host-only call inside one is an error even during the host pass. The actual
+// mechanism that keeps device code clean is the `if constexpr` on a TEMPLATE
+// PARAMETER in copyHitOffsets() below -- a discarded branch of a template is never
+// instantiated. The macro guard here only avoids *including* <experimental/simd>
+// during the device pass.
 #if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
 #define SOA_SIMD_HOST_PATH 1
+#include <stdexcept>
 #include "DataFormats/SoATemplate/interface/SoASimdMasked.h"
 #endif
 
@@ -23,148 +29,101 @@
 // vectorisation (GCC: "not vectorized: statement can throw an exception", plus
 // "statement clobbers memory" since the throw helper is a non-pure call). Here the
 // check is hoisted out of the vector body and done once per chunk, before any store.
-// Same guarantee, 1/width the cost, and the stores are explicit vector ops so no
+// Same guarantee, 1/width the cost, and the stores are explicit vector ops, so no
 // autovectoriser permission is needed.
 //
-// DESIGN: the CPU/GPU choice lives HERE, not in the kernel. `uniform_spans` yields
-// runs of rows; on CPU backends a run is up to `width` adjacent rows, on GPU backends
-// it is always a single row, so the same kernel loop compiles to the original scalar
-// code on device and to masked SIMD on host.
+// DESIGN: the CPU/GPU choice lives HERE, not in the kernel. The kernel calls one
+// function; CPU backends get masked SIMD, GPU backends get the original scalar loop.
 namespace soa_simd {
 
+  namespace detail {
+
 #ifdef SOA_SIMD_HOST_PATH
-  inline constexpr int max_lanes = width;
-#else
-  inline constexpr int max_lanes = 1;
-#endif
+    // Host-only: wraps the View and hands out a chunk of rows after ONE bounds check.
+    template <typename BaseView>
+    struct SimdTrackView : public BaseView {
+      using BaseView::BaseView;
+      // Views are cheap value types (pointers + size), so wrapping by value is fine.
+      SimdTrackView(const BaseView &v) : BaseView(v) {}
 
-  // A run of rows [index, index + lanes). Converts to int so it can still be used
-  // wherever a plain row index was used before.
-  struct Span {
-    int index;
-    int lanes;
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE constexpr operator int() const { return index; }
-  };
+      int size() const { return static_cast<int>(this->metadata().size()); }
 
-  /* uniform_spans(acc, extent)
-   *
-   * Same traversal as cms::alpakatools::uniform_elements, but yielding Spans instead
-   * of single indices. Mirrors UniformElementsAlong: each work item takes a run of
-   * `elements` rows starting at `first`, then advances by the grid `stride`.
-   *
-   * On CPU backends make_workdiv() gives threads/block == 1 and elements/thread ==
-   * block size, so a run is a CONTIGUOUS block of rows and SIMD lanes map to adjacent
-   * rows. On GPU backends elements/thread == 1, so every Span has lanes == 1 and the
-   * traversal is identical to uniform_elements.
-   */
-  template <typename TAcc>
-  class UniformSpans {
-  public:
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE UniformSpans(TAcc const &acc, int extent)
-        : extent_{extent},
-          elements_{static_cast<int>(alpaka::getWorkDiv<alpaka::Thread, alpaka::Elems>(acc)[0u])},
-          first_{static_cast<int>(alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0u]) *
-                 static_cast<int>(alpaka::getWorkDiv<alpaka::Thread, alpaka::Elems>(acc)[0u])},
-          stride_{static_cast<int>(alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0u]) *
-                  static_cast<int>(alpaka::getWorkDiv<alpaka::Thread, alpaka::Elems>(acc)[0u])} {}
+      // store proxy: ref.hitOffsets() = v  ->  masked store of the valid lanes only
+      struct hitOffsets_ref {
+        uint32_t *p_;
+        int lanes_;
+        void operator=(const vint &v) const { maskedStore(reinterpret_cast<int *>(p_), v, lanes_); }
+      };
 
-    class iterator {
-    public:
-      ALPAKA_FN_ACC ALPAKA_FN_INLINE iterator(int extent, int elements, int stride, int base)
-          : extent_{extent}, elements_{elements}, stride_{stride}, base_{base} {
-        index_ = base_;
-        runEnd_ = base_ < extent_ ? std::min(base_ + elements_, extent_) : extent_;
+      struct element_ref {
+        uint32_t *p_;
+        int lanes_;
+        hitOffsets_ref hitOffsets() const { return {p_, lanes_}; }
+      };
+
+      // THE RANGE CHECK, batched: validated once for the whole chunk, before any store.
+      // Unconditional on purpose -- it keeps this header compatible with both the old
+      // bool-based and the new Mode-enum RangeChecking APIs, and the point of the
+      // exercise is to measure the "checking ON *and* vectorised" configuration.
+      element_ref chunk(int i, int lanes) const {
+        const int n = std::min(lanes, size() - i);
+        if (i < 0 || n < 0 || i + n > size())
+          throw std::out_of_range("SimdTrackView::chunk: out of range");
+        return element_ref{const_cast<uint32_t *>(this->metadata().addressOf_hitOffsets()) + i, n};
       }
+    };
 
-      ALPAKA_FN_ACC ALPAKA_FN_INLINE Span operator*() const {
-        return Span{index_, std::min(max_lanes, runEnd_ - index_)};
-      }
-
-      ALPAKA_FN_ACC ALPAKA_FN_INLINE iterator &operator++() {
-        index_ += std::min(max_lanes, runEnd_ - index_);
-        if (index_ < runEnd_)
-          return *this;
-        base_ += stride_;
-        if (base_ < extent_) {
-          index_ = base_;
-          runEnd_ = std::min(base_ + elements_, extent_);
-        } else {
-          base_ = extent_;
-          index_ = extent_;
-          runEnd_ = extent_;
+    // Reproduces UniformElementsAlong's traversal (workdivision.h): each work item takes
+    // a run of `elements` rows starting at `first`, then advances by the grid `stride`.
+    // On CPU backends that run is CONTIGUOUS, so SIMD lanes map to adjacent rows.
+    template <typename TView, typename TCounter>
+    inline void copyHitOffsetsSimd(
+        TView tracks_view, TCounter const *off, int first, int stride, int elements, int n) {
+      SimdTrackView<TView> sview{tracks_view};
+      for (int base = first; base < n; base += stride) {
+        const int last = std::min(base + elements, n);
+        for (int i = base; i < last; i += width) {
+          const int lanes = std::min(width, last - i);
+          sview.chunk(i, lanes).hitOffsets() = maskedLoad(reinterpret_cast<const int *>(off + i + 1), lanes);
         }
-        return *this;
       }
-
-      ALPAKA_FN_ACC ALPAKA_FN_INLINE bool operator!=(iterator const &o) const { return index_ != o.index_; }
-
-    private:
-      int extent_, elements_, stride_, base_, index_, runEnd_;
-    };
-
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE iterator begin() const { return iterator(extent_, elements_, stride_, first_); }
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE iterator end() const { return iterator(extent_, elements_, stride_, extent_); }
-
-  private:
-    int extent_, elements_, first_, stride_;
-  };
-
-  template <typename TAcc, typename TExtent>
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE auto uniform_spans(TAcc const &acc, TExtent extent) {
-    return UniformSpans<TAcc>(acc, static_cast<int>(extent));
-  }
-
-  // Load `span.lanes` values starting at p. On CPU a masked vector load, on GPU a
-  // plain scalar load -- identical to what the original kernel line did.
-  ALPAKA_FN_ACC ALPAKA_FN_INLINE auto load(const uint32_t *p, Span span) {
-#ifdef SOA_SIMD_HOST_PATH
-    if constexpr (max_lanes > 1)
-      return maskedLoad(reinterpret_cast<const int *>(p), span.lanes);
-    else
-#endif
-      return *p;
-  }
-
-  template <typename BaseView>
-  struct SimdTrackView : public BaseView {
-    using BaseView::BaseView;
-    // Views are cheap value types (pointers + size), so wrapping by value is fine.
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE SimdTrackView(const BaseView &v) : BaseView(v) {}
-
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE int size() const { return static_cast<int>(this->metadata().size()); }
-
-    // store proxy: ref.hitOffsets() = v  ->  masked store of the valid lanes only
-    struct hitOffsets_ref {
-      uint32_t *p_;
-      int lanes_;
-#ifdef SOA_SIMD_HOST_PATH
-      ALPAKA_FN_INLINE void operator=(const vint &v) const { maskedStore(reinterpret_cast<int *>(p_), v, lanes_); }
-#endif
-      ALPAKA_FN_ACC ALPAKA_FN_INLINE void operator=(uint32_t v) const { *p_ = v; }
-    };
-
-    struct element_ref {
-      uint32_t *p_;
-      int lanes_;
-      ALPAKA_FN_ACC ALPAKA_FN_INLINE hitOffsets_ref hitOffsets() const { return {p_, lanes_}; }
-    };
-
-    // THE RANGE CHECK, batched: validated once for the whole span, before any store.
-    // Unconditional on purpose -- it keeps this header compatible with both the old
-    // bool-based and the new Mode-enum RangeChecking APIs, and the point of the
-    // exercise is to measure the "checking ON *and* vectorised" configuration.
-    ALPAKA_FN_ACC ALPAKA_FN_INLINE element_ref operator[](Span span) const {
-      const int n = std::min(span.lanes, size() - span.index);
-      if (span.index < 0 || n < 0 || span.index + n > size()) {
-#ifdef SOA_SIMD_HOST_PATH
-        throw std::out_of_range("SimdTrackView::operator[]: span out of range");
-#else
-        ALPAKA_ASSERT_ACC(false);
-#endif
-      }
-      return element_ref{const_cast<uint32_t *>(this->metadata().addressOf_hitOffsets()) + span.index, n};
     }
-  };
+#else
+    // Device pass: never called (the branch below is discarded), but the NAME must be
+    // declared so the discarded statement still parses.
+    template <typename TView, typename TCounter>
+    inline void copyHitOffsetsSimd(TView, TCounter const *, int, int, int, int) {}
+#endif
+
+  }  // namespace detail
+
+  /* copyHitOffsets(acc, tracks_view, off, n)
+   *
+   * Replaces:
+   *     for (auto idx : cms::alpakatools::uniform_elements(acc, n))
+   *       tracks_view[idx].hitOffsets() = off[idx + 1];
+   *
+   * CPU backends -> masked SIMD with a batched bounds check.
+   * GPU backends -> exactly the loop above, unchanged.
+   *
+   * The `if constexpr` condition depends on the template parameter TAcc, so the
+   * host-only branch is NOT instantiated when TAcc is a GPU accelerator. That is what
+   * keeps std::experimental::simd and `throw` out of device code -- preprocessor
+   * guards alone cannot, because ALPAKA_FN_ACC means __host__ __device__.
+   */
+  template <typename TAcc, typename TView, typename TCounter>
+  ALPAKA_FN_ACC ALPAKA_FN_INLINE void copyHitOffsets(TAcc const &acc, TView tracks_view, TCounter const *off, int n) {
+    if constexpr (cms::alpakatools::requires_single_thread_per_block_v<TAcc>) {
+      const int elements = static_cast<int>(alpaka::getWorkDiv<alpaka::Thread, alpaka::Elems>(acc)[0u]);
+      const int first = static_cast<int>(alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0u]) * elements;
+      const int stride = static_cast<int>(alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0u]) * elements;
+      detail::copyHitOffsetsSimd(tracks_view, off, first, stride, elements, n);
+    } else {
+      for (auto idx : cms::alpakatools::uniform_elements(acc, n)) {
+        tracks_view[idx].hitOffsets() = off[idx + 1];  // offset for track 0 is always 0
+      }
+    }
+  }
 
 }  // namespace soa_simd
 
